@@ -1,0 +1,223 @@
+# Incident lab for the Conand 2026 osctrl workshop.
+# osctrl (published images) + three enrolled osquery nodes:
+#   linux-01  compromised  runs /tmp/conand-demo (a renamed copy of sleep)
+#   linux-02  clean
+#   linux-03  compromised  stopped before Demo 2 to play the "offline" node
+# Lab-only credentials below. Never reuse them outside this laptop.
+name: conand-osctrl
+
+x-db: &db
+  DB_HOST: osctrl-postgres
+  DB_NAME: osctrl
+  DB_USER: osctrl
+  DB_PASS: ${POSTGRES_PASSWORD:-conand-lab}
+  REDIS_HOST: osctrl-redis
+  JWT_SECRET: ${JWT_SECRET:-c0nand2026c0nand2026c0nand2026c0nand2026c0nand2026c0nand2026abcd}
+
+x-service: &service
+  SERVICE_LISTENER: 0.0.0.0
+  SERVICE_LOGGER: db
+  SERVICE_POSTURE_ENABLED: 'true'
+  SERVICE_ALERTS_ENABLED: 'true'
+  SERVICE_CONFIG_ENABLED: 'true'
+  SERVICE_HEALTH_ENABLED: 'true'
+  SERVICE_EVENTS_ENABLED: 'true'
+  SERVICE_EVENTS_NAMESPACE: conand
+  SERVICE_TRUSTED_PROXIES: 172.16.0.0/12
+  OSQUERY_CONSOLE: 'true'
+  OSQUERY_FILE_EXPLORER: 'true'
+
+x-node: &node
+  build:
+    context: ./node
+    args:
+      OSCTRL_VERSION: ${OSCTRL_VERSION:-0.6.3}
+      OSQUERY_VERSION: ${OSQUERY_VERSION:-5.24.0}
+  image: conand-osctrl-node:${OSCTRL_VERSION:-0.6.3}
+  restart: unless-stopped
+  init: true
+  volumes:
+    - tls:/tls:ro
+  depends_on:
+    osctrl-cli:
+      condition: service_completed_successfully
+    osctrl-nginx:
+      condition: service_started
+
+services:
+  # Self-signed lab certificate, generated once into the tls volume.
+  osctrl-certs:
+    image: jmpsec/osctrl-cli:${OSCTRL_VERSION:-0.6.3}
+    user: root
+    restart: 'no'
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - >-
+        test -s /tls/osctrl.crt ||
+        openssl req -x509 -newkey rsa:2048 -nodes -days 30
+        -subj /CN=osctrl-nginx
+        -addext subjectAltName=DNS:osctrl-nginx,DNS:localhost,IP:127.0.0.1
+        -keyout /tls/osctrl.key -out /tls/osctrl.crt
+    volumes:
+      - tls:/tls
+
+  osctrl-nginx:
+    image: nginx:${NGINX_VERSION:-1.31.0-alpine}
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:${UI_PORT:-8444}:8444'
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - tls:/tls:ro
+    depends_on:
+      osctrl-certs:
+        condition: service_completed_successfully
+      osctrl-tls:
+        condition: service_started
+      osctrl-frontend:
+        condition: service_started
+
+  osctrl-tls:
+    image: jmpsec/osctrl-tls:${OSCTRL_VERSION:-0.6.3}
+    restart: unless-stopped
+    environment:
+      <<: [*db, *service]
+      SERVICE_PORT: '9000'
+      SERVICE_HOST: osctrl-nginx
+      SERVICE_AUTH: none
+      LOGGER_DB_SAME: 'true'
+      # Flush node check-ins every 5s (default 60s): until last_seen is written,
+      # nodes count as inactive and environment-wide queries skip them.
+      WRITER_TIMEOUT: 5s
+      # Default is 20 enrolls/min per IP; make fake enrolls 100+ from one container.
+      RATE_LIMIT_ENROLL_BURST: '500'
+    depends_on:
+      osctrl-cli:
+        condition: service_completed_successfully
+      osctrl-redis:
+        condition: service_healthy
+
+  osctrl-api:
+    image: jmpsec/osctrl-api:${OSCTRL_VERSION:-0.6.3}
+    restart: unless-stopped
+    environment:
+      <<: [*db, *service]
+      SERVICE_PORT: '9002'
+      SERVICE_HOST: localhost:${UI_PORT:-8444}
+      SERVICE_AUTH: jwt
+    depends_on:
+      osctrl-cli:
+        condition: service_completed_successfully
+      osctrl-redis:
+        condition: service_healthy
+
+  osctrl-frontend:
+    image: jmpsec/osctrl-frontend:${OSCTRL_VERSION:-0.6.3}
+    restart: unless-stopped
+    # The published image runs as nginx (101); its entrypoint selects a config.
+    tmpfs:
+      - /etc/nginx/conf.d:uid=101,gid=101,mode=0755
+      - /var/cache/nginx:uid=101,gid=101,mode=0755
+      - /run:uid=101,gid=101,mode=0755
+    depends_on:
+      - osctrl-api
+
+  # One-shot: creates the "conand" environment and the admin user.
+  osctrl-cli:
+    image: jmpsec/osctrl-cli:${OSCTRL_VERSION:-0.6.3}
+    restart: 'no'
+    command: ['/bootstrap.sh']
+    environment:
+      <<: *db
+      ENV_NAME: conand
+      OSCTRL_USER: ${OSCTRL_USER:-admin}
+      OSCTRL_PASS: ${OSCTRL_PASS:-conand}
+    volumes:
+      - ./bootstrap.sh:/bootstrap.sh:ro
+      - tls:/tls:ro
+    depends_on:
+      osctrl-certs:
+        condition: service_completed_successfully
+      osctrl-postgres:
+        condition: service_healthy
+
+  osctrl-postgres:
+    image: postgres:${POSTGRES_VERSION:-17-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: osctrl
+      POSTGRES_USER: osctrl
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-conand-lab}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U osctrl -d osctrl']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  osctrl-redis:
+    image: redis:${REDIS_VERSION:-7-alpine}
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  linux-01:
+    <<: *node
+    hostname: linux-01
+    environment:
+      <<: *db
+      ENV_NAME: conand
+      PLANT: /tmp/conand-demo
+
+  linux-02:
+    <<: *node
+    hostname: linux-02
+    environment:
+      <<: *db
+      ENV_NAME: conand
+
+  linux-03:
+    <<: *node
+    hostname: linux-03
+    environment:
+      <<: *db
+      ENV_NAME: conand
+      PLANT: /tmp/conand-demo
+
+  # Optional (make fake): simulated nodes from osctrl's fake_news_go load tool.
+  fake-nodes:
+    image: golang:${GO_VERSION:-1.27-alpine}
+    profiles: [fake]
+    restart: 'no'
+    working_dir: /state
+    command:
+      - go
+      - run
+      - github.com/jmpsec/osctrl/tools/fake_news_go@v${OSCTRL_VERSION:-0.6.3}
+      - --tls-url=https://osctrl-nginx
+      - --insecure
+      - --api-url=http://osctrl-api:9002
+      - --api-username=${OSCTRL_USER:-admin}
+      - --api-password=${OSCTRL_PASS:-conand}
+      - --discover-envs
+      - --nodes=${FAKE_NODES:-100}
+      - --enroll-delay=100
+      - --display-mode=summary
+    volumes:
+      - gomod:/go/pkg/mod
+      - fake:/state
+    depends_on:
+      osctrl-nginx:
+        condition: service_started
+      osctrl-api:
+        condition: service_started
+
+volumes:
+  postgres:
+  tls:
+  gomod:
+  fake:
